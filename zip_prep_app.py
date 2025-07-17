@@ -1,5 +1,3 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
 from io import BytesIO
@@ -7,18 +5,29 @@ import os
 import zipfile
 
 from rdkit import Chem
-from rdkit.Chem import rdmolfiles
+from rdkit.Chem import rdmolfiles, AllChem
 
 # ---- Helper Functions ----
 
-def get_protein_id(protein_filename):
-    # Strip extension; you may want to use just first token (before _ etc.) if needed
-    return os.path.splitext(protein_filename)[0]
+def get_protein_id(protein_file):
+    """Extracts protein ID from header or filename."""
+    try:
+        header = protein_file.read(2048).decode('utf-8', errors='ignore').splitlines()
+        for line in header:
+            if line.startswith("HEADER") or line.startswith("COMPND") or line.startswith("TITLE"):
+                tokens = line.strip().split()
+                for token in tokens:
+                    if len(token) == 4 and token.isalnum():
+                        protein_file.seek(0)
+                        return token
+    except Exception:
+        pass
+    protein_file.seek(0)
+    return os.path.splitext(protein_file.name)[0]
 
 def ligand_to_mol2(ligand_file, ext):
-    """Convert ligand to MOL2 format, supports mol2, sdf, pdb using RDKit."""
-    # Accept: ext (string with .mol2/.sdf/.pdb)
-    # Returns: bytes of .mol2 file, or None if failed
+    """Convert ligand to MOL2 format using RDKit."""
+    mols = []
     if ext.lower() == ".mol2":
         return ligand_file.read()
     elif ext.lower() == ".sdf":
@@ -31,21 +40,63 @@ def ligand_to_mol2(ligand_file, ext):
         try:
             pdb_block = ligand_file.read().decode("utf-8")
             mol = Chem.MolFromPDBBlock(pdb_block, sanitize=True, removeHs=False)
+            mol = Chem.AddHs(mol)
             mols = [mol] if mol is not None else []
         except Exception:
             return None
-    else:
-        mols = []
 
     if not mols:
         return None
-    out = BytesIO()
-    writer = rdmolfiles.Mol2Writer(out)
-    for m in mols:
-        if m is not None:
-            writer.write(m)
-    writer.flush()
-    return out.getvalue()
+
+    try:
+        out = BytesIO()
+        writer = rdmolfiles.Mol2Writer(out)
+        for m in mols:
+            if m is not None:
+                writer.write(m)
+        writer.flush()
+        return out.getvalue()
+    except Exception as e:
+        print(f"MOL2 conversion error: {e}")
+        return None
+
+def extract_pocket(protein_pdb_bytes, ligand_mol):
+    """Extract atoms from protein within 6Å of ligand."""
+    try:
+        pdb_str = protein_pdb_bytes.decode('utf-8')
+        protein_mol = Chem.MolFromPDBBlock(pdb_str, sanitize=False, removeHs=False)
+        if protein_mol is None:
+            return None
+
+        ligand_conf = ligand_mol.GetConformer()
+        pocket_atoms = []
+
+        for atom in protein_mol.GetAtoms():
+            idx = atom.GetIdx()
+            try:
+                pos = protein_mol.GetConformer().GetAtomPosition(idx)
+            except:
+                continue
+            for l_idx in range(ligand_mol.GetNumAtoms()):
+                l_pos = ligand_conf.GetAtomPosition(l_idx)
+                if pos.Distance(l_pos) <= 6.0:
+                    pocket_atoms.append(protein_mol.GetAtomWithIdx(idx))
+                    break
+
+        atom_ids = [atom.GetIdx() for atom in pocket_atoms]
+        if not atom_ids:
+            return None
+        pocket = Chem.PathToSubmol(protein_mol, atom_ids)
+
+        out = BytesIO()
+        writer = rdmolfiles.Mol2Writer(out)
+        writer.write(pocket)
+        writer.flush()
+        return out.getvalue()
+
+    except Exception as e:
+        print(f"Pocket detection error: {e}")
+        return None
 
 def make_zip(filename, content):
     mem_zip = BytesIO()
@@ -58,46 +109,44 @@ def make_zip(filename, content):
 
 st.title("Protein-Ligand Zip File Preparer")
 
-st.markdown(
-    """
-    **Instructions:**  
-    1. Upload a **protein file** (.pdb or .mol2)  
-    2. Upload a **ligand file** (.mol2, .sdf, or .pdb)  
-    3. Download the packaged zip files and the metadata CSV  
-    """
-)
+st.markdown("""
+**Instructions:**  
+1. Upload a **protein file** (.pdb or .mol2)  
+2. Upload a **ligand file** (.mol2, .sdf, or .pdb)  
+3. Download the packaged zip files and the metadata CSV  
+""")
 
-protein_up = st.file_uploader(
-    "Protein file (.pdb, .mol2)", type=["pdb", "mol2"], key="protein"
-)
-ligand_up = st.file_uploader(
-    "Ligand file (.pdb, .mol2, .sdf)", type=["pdb", "mol2", "sdf"], key="ligand"
-)
+protein_up = st.file_uploader("Protein file (.pdb, .mol2)", type=["pdb", "mol2"], key="protein")
+ligand_up = st.file_uploader("Ligand file (.pdb, .mol2, .sdf)", type=["pdb", "mol2", "sdf"], key="ligand")
 
 if protein_up and ligand_up:
-    protein_filename = protein_up.name
-    protein_id = get_protein_id(protein_filename)
+    protein_id = get_protein_id(protein_up)
     ligand_ext = os.path.splitext(ligand_up.name)[1]
 
-    # Read protein file (as is, you may want to do conversion if necessary)
     protein_content = protein_up.read()
-
-    # Ligand: convert to mol2
     ligand_mol2 = ligand_to_mol2(ligand_up, ligand_ext)
     if ligand_mol2 is None:
         st.error("Failed to convert ligand to MOL2. Please check file format/content.")
         st.stop()
 
-    # "Pocket" content: here just duplicating protein as placeholder
-    # Replace with real pocket extraction if you have it
-    pocket_content = protein_content
+    # Extract ligand mol from converted MOL2
+    mol2_reader = rdmolfiles.Mol2MolSupplier(BytesIO(ligand_mol2))
+    ligand_mol = next((m for m in mol2_reader if m is not None), None)
+    if ligand_mol is None:
+        st.error("Could not parse converted MOL2 ligand.")
+        st.stop()
 
-    # Naming convention
+    pocket_content = extract_pocket(protein_content, ligand_mol)
+    if pocket_content is None:
+        st.warning("Pocket extraction failed. Using full protein as fallback.")
+        pocket_content = protein_content
+
+    # Naming
     pocket_name = f"{protein_id}_Pocket.mol2"
     ligand_name = f"{protein_id}_Ligand.mol2"
     protein_name = f"{protein_id}.mol2"
 
-    # Create zips
+    # Create ZIPs
     zip_pocket = make_zip(pocket_name, pocket_content)
     zip_ligand = make_zip(ligand_name, ligand_mol2)
     zip_protein = make_zip(protein_name, protein_content)
@@ -110,27 +159,12 @@ if protein_up and ligand_up:
     }])
     csv_bytes = selected_df.to_csv(index=False).encode("utf-8")
 
-    st.success("Files created! Please download below:")
+    st.success("✅ Files created! Please download below:")
 
-    st.download_button(
-        label=f"Download {pocket_name}.zip",
-        data=zip_pocket,
-        file_name=f"{protein_id}_Pocket.zip"
-    )
-    st.download_button(
-        label=f"Download {ligand_name}.zip",
-        data=zip_ligand,
-        file_name=f"{protein_id}_Ligand.zip"
-    )
-    st.download_button(
-        label=f"Download {protein_name}.zip",
-        data=zip_protein,
-        file_name=f"{protein_id}.zip"
-    )
-    st.download_button(
-        label="Download selected.csv",
-        data=csv_bytes,
-        file_name="selected.csv"
-    )
+    st.download_button(f"📥 Download {pocket_name}.zip", zip_pocket, f"{protein_id}_Pocket.zip")
+    st.download_button(f"📥 Download {ligand_name}.zip", zip_ligand, f"{protein_id}_Ligand.zip")
+    st.download_button(f"📥 Download {protein_name}.zip", zip_protein, f"{protein_id}.zip")
+    st.download_button("📄 Download selected.csv", csv_bytes, "selected.csv")
+
 else:
     st.info("Please upload both a protein and a ligand file to proceed.")
