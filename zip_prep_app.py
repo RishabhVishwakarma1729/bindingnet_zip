@@ -26,29 +26,43 @@ def get_protein_id(protein_file):
     return os.path.splitext(protein_file.name)[0]
 
 def ligand_to_mol2(ligand_file, ext):
-    """Convert ligand to MOL2 format using RDKit."""
+    """Convert ligand to MOL2 format using RDKit with better diagnostics."""
     mols = []
-    if ext.lower() == ".mol2":
-        return ligand_file.read()
-    elif ext.lower() == ".sdf":
-        try:
-            suppl = Chem.ForwardSDMolSupplier(ligand_file)
-            mols = [m for m in suppl if m is not None]
-        except Exception:
-            return None
-    elif ext.lower() == ".pdb":
-        try:
-            pdb_block = ligand_file.read().decode("utf-8")
-            mol = Chem.MolFromPDBBlock(pdb_block, sanitize=True, removeHs=False)
-            mol = Chem.AddHs(mol)
-            mols = [mol] if mol is not None else []
-        except Exception:
-            return None
-
-    if not mols:
-        return None
 
     try:
+        if ext.lower() == ".mol2":
+            # Just read it directly
+            content = ligand_file.read()
+            if not content:
+                st.error("Uploaded MOL2 file is empty.")
+                return None
+            return content
+
+        elif ext.lower() == ".sdf":
+            suppl = Chem.ForwardSDMolSupplier(ligand_file)
+            mols = [m for m in suppl if m is not None]
+            if not mols:
+                st.error("RDKit could not read any valid molecule from the SDF file.")
+                return None
+
+        elif ext.lower() == ".pdb":
+            pdb_block = ligand_file.read().decode("utf-8")
+            mol = Chem.MolFromPDBBlock(pdb_block, sanitize=True, removeHs=False)
+            if mol is None:
+                st.error("RDKit could not parse the PDB block.")
+                return None
+            mol = Chem.AddHs(mol)
+            mols = [mol]
+
+        else:
+            st.error(f"Unsupported ligand file type: {ext}")
+            return None
+
+        if not mols:
+            st.error("No valid molecule found in the ligand file.")
+            return None
+
+        # Write to MOL2 format
         out = BytesIO()
         writer = rdmolfiles.Mol2Writer(out)
         for m in mols:
@@ -56,46 +70,9 @@ def ligand_to_mol2(ligand_file, ext):
                 writer.write(m)
         writer.flush()
         return out.getvalue()
-    except Exception as e:
-        print(f"MOL2 conversion error: {e}")
-        return None
-
-def extract_pocket(protein_pdb_bytes, ligand_mol):
-    """Extract atoms from protein within 6Å of ligand."""
-    try:
-        pdb_str = protein_pdb_bytes.decode('utf-8')
-        protein_mol = Chem.MolFromPDBBlock(pdb_str, sanitize=False, removeHs=False)
-        if protein_mol is None:
-            return None
-
-        ligand_conf = ligand_mol.GetConformer()
-        pocket_atoms = []
-
-        for atom in protein_mol.GetAtoms():
-            idx = atom.GetIdx()
-            try:
-                pos = protein_mol.GetConformer().GetAtomPosition(idx)
-            except:
-                continue
-            for l_idx in range(ligand_mol.GetNumAtoms()):
-                l_pos = ligand_conf.GetAtomPosition(l_idx)
-                if pos.Distance(l_pos) <= 6.0:
-                    pocket_atoms.append(protein_mol.GetAtomWithIdx(idx))
-                    break
-
-        atom_ids = [atom.GetIdx() for atom in pocket_atoms]
-        if not atom_ids:
-            return None
-        pocket = Chem.PathToSubmol(protein_mol, atom_ids)
-
-        out = BytesIO()
-        writer = rdmolfiles.Mol2Writer(out)
-        writer.write(pocket)
-        writer.flush()
-        return out.getvalue()
 
     except Exception as e:
-        print(f"Pocket detection error: {e}")
+        st.error(f"Exception during ligand conversion: {e}")
         return None
 
 def make_zip(filename, content):
